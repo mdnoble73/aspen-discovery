@@ -45,6 +45,15 @@ function getUpdates24_04_00(): array {
 					"ALTER TABLE themes ADD COLUMN IF NOT EXISTS customHeadingFontData LONGBLOB DEFAULT NULL",
 					"ALTER TABLE themes ADD COLUMN IF NOT EXISTS customBodyFontData LONGBLOB DEFAULT NULL",
 				]
+			],
+
+			'migrate_uploaded_files' => [
+				'title' => 'Migrate uploaded files to store into database',
+				'description' => 'Migrate uploaded files to store into database',
+				'continueOnError' => true,
+				'sql' => [
+					'migrateUploadedFiles'
+				]
 			]
 
 		//alexander - PTFS Europe
@@ -55,4 +64,23 @@ function getUpdates24_04_00(): array {
 
 
 	];
+
+
+}
+
+function migrateUploadedFiles(&$update) {
+	require_once ROOT_DIR . 'sys/File/FileUpload.php';
+	$uploadedFile = new FileUpload();
+	$uploadedFile->find();
+	$numUpdates = 0;
+	while ($uploadedFile->fetch()){
+		if (isset($uploadedFile->fullPath) && !isset($uploadedFile->uploadedFileData)){
+			$dataFromPath = file_get_contents($uploadedFile->fullPath);
+			$uploadedFile->uploadedFileData = $dataFromPath;
+			unset($uploadedFile->fullPath);
+			$numUpdates+= $uploadedFile->insert();
+		}
+	}
+	$update['status'] = "<strong>Migrated $numUpdates uploaded files</strong><br/>";
+	$update['success'] = true;
 }
