@@ -5628,6 +5628,21 @@ AspenDiscovery.Account = (function () {
 			}).fail(function(jqXHR, textStatus, errorThrown) {
 				AspenDiscovery.ajaxFail(jqXHR, textStatus, errorThrown);
 			});
+		},
+		joinEventWaitingList: function (eventSourceId) {
+			var url = Globals.path + "/MyAccount/AJAX?method=joinEventWaitingList";
+			var params = {
+				eventInstanceId: eventSourceId.replace(/aspenEvent_\d+_/, ''),
+				sourceId: eventSourceId
+			}
+			$.getJSON(url, params, function(data) {
+				if (data.success) {
+					AspenDiscovery.showMessage(data.title, data.message, true, true);
+				} else {
+					AspenDiscovery.showMessage(data.title, data.message);
+				}
+			}).fail (AspenDiscovery.ajaxFail);
+			return false;
 		}
 	};
 }(AspenDiscovery.Account || {}));
@@ -10675,8 +10690,16 @@ AspenDiscovery.Events = (function(){
 						// Wait a tick for the DOM to render before running the display logic
 						setTimeout(function() {
 							AspenDiscovery.Events.displayRegistrationNumberOfSeats();
+							AspenDiscovery.Events.displayWaitingListEnable();
+							AspenDiscovery.Events.displayWaitingListNumberOfSeats();
+
 							$('#registrationRequired').off('change').on('change', function() {
 								AspenDiscovery.Events.displayRegistrationNumberOfSeats();
+								AspenDiscovery.Events.displayWaitingListEnable();
+								AspenDiscovery.Events.displayWaitingListNumberOfSeats();
+							});
+							$('#waitingList').off('change').on('change', function() {
+								AspenDiscovery.Events.displayWaitingListNumberOfSeats();
 							});
 						}, 0);
 
@@ -11262,6 +11285,8 @@ AspenDiscovery.Events = (function(){
 		},
 		handleRegistrationEnabledToggle: function () {
 			AspenDiscovery.Events.displayRegistrationNumberOfSeats();
+			AspenDiscovery.Events.displayWaitingListEnable();
+			AspenDiscovery.Events.displayWaitingListNumberOfSeats();
 		},
 		displayRegistrationNumberOfSeats: function () {
 			const requireEventRegistration = document.getElementById('registrationRequired');
@@ -11280,6 +11305,26 @@ AspenDiscovery.Events = (function(){
 			}
 			AspenDiscovery.Events.unsetNumberOfSeats();
 			registrationNumberOfSeats.style.display = 'none';
+		},
+		displayWaitingListEnable: function () {
+			let requireEventRegistration = document.getElementById('registrationRequired');
+			let waitingListEnabled = document.getElementById('propertyRowwaitingList');
+
+			if (requireEventRegistration && requireEventRegistration.checked) {
+				waitingListEnabled.style.display = '';
+			} else {
+				waitingListEnabled.style.display = 'none';
+			}
+		},
+		displayWaitingListNumberOfSeats: function () {
+			let waitingList = document.getElementById('waitingList');
+			let waitingListNumberOfSeats = document.getElementById('propertyRowwaitingListNumberOfSeats');
+
+			if (waitingList && waitingList.checked) {
+				waitingListNumberOfSeats.style.display = '';
+			} else {
+				waitingListNumberOfSeats.style.display = 'none';
+			}
 		},
 		unsetNumberOfSeats: function () {
 			let numberofSeats = document.getElementById('numberOfSeats');
