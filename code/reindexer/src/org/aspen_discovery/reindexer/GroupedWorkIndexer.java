@@ -1,6 +1,8 @@
 package org.aspen_discovery.reindexer;
 
-import org.apache.solr.client.solrj.impl.BinaryResponseParser;
+import org.apache.solr.client.solrj.request.CoreAdminRequest;
+import org.apache.solr.client.solrj.request.CoreStatus;
+import org.apache.solr.client.solrj.response.CoreAdminResponse;
 import org.aspen_discovery.grouping.*;
 import com.turning_leaf_technologies.indexing.*;
 import com.turning_leaf_technologies.logging.BaseIndexingLogEntry;
@@ -9,7 +11,6 @@ import com.turning_leaf_technologies.strings.AspenStringUtils;
 import com.turning_leaf_technologies.util.MaxSizeHashMap;
 import org.apache.solr.client.solrj.SolrServerException;
 import org.apache.solr.client.solrj.impl.ConcurrentUpdateHttp2SolrClient;
-import org.apache.solr.client.solrj.impl.BaseHttpSolrClient;
 import org.apache.solr.client.solrj.impl.Http2SolrClient;
 import org.apache.solr.client.solrj.response.UpdateResponse;
 import org.apache.solr.common.SolrInputDocument;
@@ -207,6 +208,8 @@ public class GroupedWorkIndexer implements AutoCloseable {
 	private int hooplaVersion;
 	private int solrThreadCount;
 	private int solrQueueSize;
+	private String solrPort;
+	private String solrHost;
 
 	public GroupedWorkIndexer(String serverName, Connection dbConn, Ini configIni, boolean fullReindex, boolean clearIndex, BaseIndexingLogEntry logEntry, Logger logger) {
 		this(serverName, dbConn, configIni, fullReindex, clearIndex, false, logEntry, logger);
@@ -223,14 +226,14 @@ public class GroupedWorkIndexer implements AutoCloseable {
 		this.clearIndex = clearIndex;
 		this.regroupAllRecords = regroupAllRecords;
 
-		String solrPort = configIni.get("Index", "solrPort");
+		solrPort = configIni.get("Index", "solrPort");
 		if (solrPort == null || solrPort.isEmpty()) {
 			solrPort = configIni.get("Reindex", "solrPort");
 			if (solrPort == null || solrPort.isEmpty()) {
 				solrPort = "8080";
 			}
 		}
-		String solrHost = configIni.get("Index", "solrHost");
+		solrHost = configIni.get("Index", "solrHost");
 		if (solrHost == null || solrHost.isEmpty()) {
 			solrHost = configIni.get("Reindex", "solrHost");
 			if (solrHost == null || solrHost.isEmpty()) {
@@ -432,9 +435,7 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			.connectionTimeout(15000)
 			.build();
 		try {
-
-
-		updateServer = new ConcurrentUpdateHttp2SolrClient.Builder(solrUrl, http2Client)
+			updateServer = new ConcurrentUpdateHttp2SolrClient.Builder(solrUrl, http2Client)
 				.withThreadCount(solrThreadCount)
 				.withQueueSize(solrQueueSize)
 				.build();
@@ -736,16 +737,54 @@ public class GroupedWorkIndexer implements AutoCloseable {
 	}
 
 	private void clearIndex() {
-		//Check to see if we should clear the existing index
-		logger.info("Clearing existing MARC records from index");
-		try {
-			updateServer.deleteByQuery("recordtype:grouped_work");
-			//3-19-2019 Don't commit so the index does not get cleared during run (but will clear at the end).
-		} catch (BaseHttpSolrClient.RemoteSolrException rse) {
-			logEntry.incErrors("Solr is not running properly, try restarting", rse);
-			System.exit(-1);
+		//Do a full clear of the index by stopping the core and deleting all records. This is needed when changing
+		//field definitions. The clear index is generally only called during development and is never called automatically
+		//by cron or other mechanism.
+		String solrAdminUrl = "http://" + solrHost + ":" + solrPort + "/solr";
+		try (Http2SolrClient adminClient =
+			 new Http2SolrClient.Builder(solrAdminUrl)
+				 .idleTimeout(60000)
+				 .connectionTimeout(15000)
+				 .build()) {
+
+				String coreName = "grouped_works_v2";
+				if (indexVersion != 2) {
+					coreName ="grouped_works_v3";
+				}
+
+				CoreStatus status = CoreAdminRequest.getCoreStatus(coreName, adminClient);
+
+				String instanceDir = status.getInstanceDirectory();
+
+				CoreAdminRequest.Unload unload = new CoreAdminRequest.Unload(true);
+				unload.setCoreName(coreName);
+
+				unload.setDeleteIndex(true);
+				unload.setDeleteDataDir(true);
+				unload.setDeleteInstanceDir(false);
+
+				CoreAdminResponse unloadResponse = unload.process(adminClient);
+
+				if (unloadResponse.getStatus() != 0) {
+					throw new IllegalStateException(
+						"Unable to unload core: " + unloadResponse
+					);
+				}
+
+				CoreAdminRequest.Create create = new CoreAdminRequest.Create();
+				create.setCoreName(coreName);
+				create.setInstanceDir(instanceDir);
+
+				CoreAdminResponse createResponse = create.process(adminClient);
+
+				if (createResponse.getStatus() != 0) {
+					throw new IllegalStateException(
+						"Unable to recreate core: " + createResponse
+					);
+				}
+
 		} catch (Exception e) {
-			logEntry.incErrors("Error deleting from index", e);
+			logEntry.incErrors("Could not clear core", e);
 		}
 	}
 
@@ -770,9 +809,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			//With this commit, we get errors in the log "Previous SolrRequestInfo was not closed!"
 			//Allow auto commit functionality to handle this
 			totalRecordsHandled++;
-			if (totalRecordsHandled % this.deletionCommitInterval == 0) {
-				this.commitChanges();
-			}
 
 			/*
 			Delete the work from the database?
@@ -814,14 +850,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 		processScheduledWorks(logEntry, true, 100);
 
 		try {
-			updateServer.commit(false, false, true);
-		}catch (Exception e) {
-			logEntry.incErrors("Error in final commit while finishing extract, shutting down", e);
-			logEntry.setFinished();
-			logEntry.saveResults();
-			System.exit(-3);
-		}
-		try {
 			logEntry.addNote("Shutting down the update server");
 			updateServer.blockUntilFinished();
 		}catch (Exception e) {
@@ -841,14 +869,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			logEntry.setFinished();
 			logEntry.saveResults();
 			System.exit(-5);
-		}
-	}
-
-	public void commitChanges(){
-		try {
-			updateServer.commit(false, false, true);
-		}catch (Exception e) {
-			logEntry.incErrors("Error committing changes ", e);
 		}
 	}
 
@@ -916,15 +936,11 @@ public class GroupedWorkIndexer implements AutoCloseable {
 					scheduledWorksRS.close();
 					break;
 				}
-				if (numWorksProcessed % this.indexCommitInterval == 0) {
-					this.commitChanges();
-				}
 			}
 			if (numWorksProcessed > 0){
 				if (doLogging) {
 					logEntry.addNote("Processed " + numWorksProcessed + " works that were scheduled for indexing");
 				}
-				this.commitChanges();
 			}
 		}catch (Exception e){
 			logEntry.addNote("Error updating scheduled works " + e);
@@ -938,8 +954,8 @@ public class GroupedWorkIndexer implements AutoCloseable {
 		logEntry.addNote("Finishing indexing");
 		if (fullReindex) {
 			try {
-				logEntry.addNote("Calling final commit");
-				updateServer.commit(false, false, true);
+				logEntry.addNote("Waiting for update server to finish");
+				updateServer.blockUntilFinished();
 			} catch (Exception e) {
 				logEntry.incErrors("Error calling final commit", e);
 			}
@@ -972,9 +988,8 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			updateLastReindexTime();
 		}else {
 			try {
-				logEntry.addNote("Doing a soft commit to make sure changes are saved");
+				logEntry.addNote("Waiting for update server to finish");
 				updateServer.blockUntilFinished();
-				updateServer.commit(false, false, true);
 				logEntry.addNote("Shutting down the update server");
 				updateServer.shutdownNow();
 				updateServer.close();
@@ -1050,14 +1065,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 					//Testing shows that regular commits do seem to improve performance.
 					//However, we can't do it too often, or we get errors with too many searchers warming.
 					//This is happening now with the auto commit settings in solrconfig.xml
-					if (numWorksProcessed % indexCommitInterval == 0) {
-						try {
-							logger.info("Doing a regular commit during full indexing");
-							updateServer.commit(false, false, true);
-						} catch (Exception e) {
-							logger.warn("Error committing changes", e);
-						}
-					}
 					//Change to a debug statement to avoid filling up the notes.
 					logger.debug("Processed {} grouped works processed.", numWorksProcessed);
 				}
@@ -1116,13 +1123,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			}else {
 				deleteRecord(permanentId, groupedWorkId);
 				numDeleted++;
-				if (numDeleted % this.deletionCommitInterval == 0) {
-					try {
-						updateServer.commit(false, false, true);
-					} catch (Exception e) {
-						logger.warn("Error committing changes", e);
-					}
-				}
 			}
 			numProcessed++;
 			if (numProcessed % 1000 == 0) {
@@ -1150,9 +1150,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			}
 			getGroupedWorkInfoRS.close();
 			totalRecordsHandled++;
-			if (totalRecordsHandled % this.indexCommitInterval == 0) {
-				updateServer.commit(false, false, true);
-			}
 		} catch (Exception e) {
 			logEntry.incErrors("Error indexing grouped work " + permanentId + " by id", e);
 		}
@@ -1949,11 +1946,17 @@ public class GroupedWorkIndexer implements AutoCloseable {
 			addSeriesMemberStmt.setString(2, groupedWork.getId());
 			if (!volume.isEmpty()) {
 				addSeriesMemberStmt.setString(3, AspenStringUtils.trimTo(100, volume)); // Add volume
-				long seriesWeight = Long.parseLong(volume);
-				if (seriesWeight > Integer.MAX_VALUE) {
+				long seriesWeight = 0;
+				if (AspenStringUtils.isNumeric(volume)) {
+					float seriesWeightFloat = Float.parseFloat(volume);
+					seriesWeight = (int)seriesWeightFloat;
+					if (seriesWeight > Integer.MAX_VALUE) {
+						seriesWeight = Integer.MAX_VALUE;
+					}
+				}else{
 					seriesWeight = Integer.MAX_VALUE;
 				}
-				addSeriesMemberStmt.setLong(8, seriesWeight); // Add volume as weight if it's an integer - 0 otherwise
+				addSeriesMemberStmt.setLong(8, seriesWeight); // Add volume as weight if it's an integer - max int otherwise
 			} else {
 				addSeriesMemberStmt.setString(3, "");
 				addSeriesMemberStmt.setLong(8, 0);
@@ -1979,7 +1982,7 @@ public class GroupedWorkIndexer implements AutoCloseable {
 				setSeriesDateUpdated.executeUpdate();
 			}
 		} catch (Exception e) {
-			logEntry.incErrors("Adding series member " + seriesInfo.getSeriesName(), e);
+			logEntry.incErrors("Error Adding series member with volume " + seriesInfo.getSeriesName() + " grouped work " + groupedWork.getId(), e);
 		}
 	}
 
@@ -3636,7 +3639,7 @@ public class GroupedWorkIndexer implements AutoCloseable {
 	 */
 	public synchronized MarcStatus saveMarcRecordToDatabase(BaseIndexingSettings indexingProfile, String ilsId, Record marcRecord) {
 		// Filter out any private fields from the record
-		marcRecord = filterPrivateFields(marcRecord);
+		filterPrivateFields(marcRecord);
 
 		ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
 		MarcWriter writer = new MarcJsonWriter(outputStream);
@@ -3689,7 +3692,7 @@ public class GroupedWorkIndexer implements AutoCloseable {
 		return returnValue;
 	}
 
-	private Record filterPrivateFields(Record marcRecord){
+	private void filterPrivateFields(Record marcRecord){
 		String[] privateFields = {"541", "542", "561", "583"};
 		for (String tag : privateFields) {
 			List<VariableField> fields = new ArrayList<>(marcRecord.getVariableFields(tag));
@@ -3700,8 +3703,6 @@ public class GroupedWorkIndexer implements AutoCloseable {
 				}
 			}
 		}
-
-		return marcRecord;
 	}
 
 	//Create a small cache to hold recently used marc records to avoid time reloading them.
@@ -3755,5 +3756,25 @@ public class GroupedWorkIndexer implements AutoCloseable {
 
 	public int getSeriesVersion() {
 		return seriesVersion;
+	}
+
+	/**
+	 * Remove unneeded/undesired target audiences based on other values that are available.
+	 *
+	 * @param targetAudiences - The raw audiences that are supplied
+	 * @return The cleaned set
+	 */
+	public HashSet<String> cleanTargetAudiences(HashSet<String> targetAudiences) {
+		if (targetAudiences.size() > 1 || !this.isTreatUnknownAudienceAsUnknown()) {
+			targetAudiences.remove("Unknown");
+		}
+		if (targetAudiences.size() > 1) {
+			targetAudiences.remove("No Attempt To Code");
+			targetAudiences.remove("Other");
+		}
+		if (targetAudiences.isEmpty()) {
+			targetAudiences.add(this.getTreatUnknownAudienceAs());
+		}
+		return targetAudiences;
 	}
 }
